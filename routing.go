@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"path"
+  "strings"
 	"sync"
 	"time"
 
@@ -23,6 +26,10 @@ import (
 )
 
 // This file implements the Routing interface for the IpfsDHT struct.
+
+// Global vars for experiment
+var activeTesting map[string]bool
+var activeTestingLock sync.RWMutex
 
 // Basic Put/Get
 
@@ -376,8 +383,36 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 	} else if !key.Defined() {
 		return fmt.Errorf("invalid cid: undefined")
 	}
+	// Check if this provide is called after as part of an experiment
+	log := false
+	ipfsTestFolder := os.Getenv("PERFORMANCE_TEST_DIR")
+	if ipfsTestFolder == "" {
+		ipfsTestFolder = "/ipfs-tests"
+	}
+	if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("provide-%v", key.String()))); err == nil {
+		os.Remove(path.Join(ipfsTestFolder, fmt.Sprintf("provide-%v", key.String())))
+		log = true
+		activeTestingLock.Lock()
+		if activeTesting == nil {
+			activeTesting = map[string]bool{}
+		}
+		_, ok := activeTesting[key.String()]
+		if ok {
+			// There is an active testing on.
+			activeTestingLock.Unlock()
+			return nil
+		} else {
+			activeTesting[key.String()] = true
+		}
+		activeTestingLock.Unlock()
+	}
+
 	keyMH := key.Hash()
 	logger.Debugw("providing", "cid", key, "mh", internal.LoggableProviderRecordBytes(keyMH))
+	if log {
+    fmt.Printf("%s: Start providing cid %v\n", time.Now().Format(time.RFC3339Nano), key.String())
+	}
+
 
 	// add self locally
 	dht.providerStore.AddProvider(ctx, keyMH, peer.AddrInfo{ID: dht.self})
@@ -407,7 +442,68 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 	}
 
 	var exceededDeadline bool
-	peers, err := dht.GetClosestPeers(closerCtx, string(keyMH))
+	if log {
+    fmt.Printf("%s: Start getting closest peers to cid %v\n", time.Now().Format(time.RFC3339Nano), key.String())
+	}
+	peers, err := func(ctx context.Context, key string) ([]peer.ID, error) {
+		if key == "" {
+			return nil, fmt.Errorf("can't lookup empty key")
+		}
+		//TODO: I can break the interface! return []peer.ID
+		lookupRes, err := dht.runLookupWithFollowup(ctx, key,
+			func(ctx context.Context, p peer.ID) ([]*peer.AddrInfo, error) {
+				// For DHT query command
+				routing.PublishQueryEvent(ctx, &routing.QueryEvent{
+					Type: routing.SendingQuery,
+					ID:   p,
+				})
+				agentVersion := "n.a."
+				if log {
+					if agent, err := dht.peerstore.Get(p, "AgentVersion"); err == nil {
+						agentVersion = agent.(string)
+					}
+          fmt.Printf("%s: Getting closest peers for cid %v from %v(%v)\n", time.Now().Format(time.RFC3339Nano), peer.ID(key).String(), p.String(), agentVersion)
+				}
+
+				peers, err := dht.protoMessenger.GetClosestPeers(ctx, p, peer.ID(key))
+				if err != nil {
+					logger.Debugf("error getting closer peers: %s", err)
+					return nil, err
+				}
+
+				if log {
+          msg := fmt.Sprintf("%s: Got %v closest peers to cid %v from %v(%v): ", time.Now().Format(time.RFC3339Nano), len(peers), peer.ID(key).String(), p.String(), agentVersion)
+					for _, peer := range peers {
+						msg = fmt.Sprintf("%v %v", msg, peer.ID.String())
+					}
+					fmt.Println(msg)
+				}
+
+				// For DHT query command
+				routing.PublishQueryEvent(ctx, &routing.QueryEvent{
+					Type:      routing.PeerResponse,
+					ID:        p,
+					Responses: peers,
+				})
+
+				return peers, err
+			},
+			func() bool { return false },
+		)
+
+		if err != nil {
+			return nil, err
+		}
+
+		if ctx.Err() == nil && lookupRes.completed {
+			// refresh the cpl for this key as the query was successful
+			dht.routingTable.ResetCplRefreshedAtForID(kb.ConvertKey(key), time.Now())
+		}
+
+		return lookupRes.peers, ctx.Err()
+	}(closerCtx, string(keyMH))
+
+
 	switch err {
 	case context.DeadlineExceeded:
 		// If the _inner_ deadline has been exceeded but the _outer_
@@ -421,6 +517,17 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 	default:
 		return err
 	}
+	if log {
+    fmt.Printf("%s: In total, got %v closest peers to cid %v to publish record: ", time.Now().Format(time.RFC3339Nano), len(peers), key.String())
+		for _, peer := range peers {
+			agentVersion := "n.a."
+			if agent, err := dht.peerstore.Get(peer, "AgentVersion"); err == nil {
+				agentVersion = agent.(string)
+			}
+			fmt.Printf("%v(%v) ", peer.String(), agentVersion)
+		}
+		fmt.Println()
+	}
 
 	wg := sync.WaitGroup{}
 	for _, p := range peers {
@@ -428,13 +535,44 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 		go func(p peer.ID) {
 			defer wg.Done()
 			logger.Debugf("putProvider(%s, %s)", internal.LoggableProviderRecordBytes(keyMH), p)
+			start := time.Now()
 			err := dht.protoMessenger.PutProvider(ctx, p, keyMH, dht.host)
+			agentVersion := "n.a."
+			if agent, err := dht.peerstore.Get(p, "AgentVersion"); err == nil {
+				agentVersion = agent.(string)
+			}
 			if err != nil {
+				if log {
+					errStr := strings.ReplaceAll(err.Error(), "\n", " ")
+          fmt.Printf("%s: Error putting provider record for cid %v to %v(%v) [%v] time taken: %v\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion, errStr, time.Since(start))
+				}
 				logger.Debug(err)
+			} else {
+				if log {
+          fmt.Printf("%s: Succeed in putting provider record for cid %v to %v(%v) time taken: %v\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion, time.Since(start))
+					// Now try to get the record from the peer
+					pvds, _, err := dht.protoMessenger.GetProviders(ctx, p, keyMH)
+					if err != nil {
+            fmt.Printf("%s: Error getting provider record for cid %v from %v(%v) after a successful put %v\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion, err.Error())
+					} else {
+            msg := fmt.Sprintf("%s: Got %v provider records back from %v(%v) after a successful put: ", time.Now().Format(time.RFC3339Nano), len(pvds), p.String(), agentVersion)
+						for _, pvd := range pvds {
+							msg = fmt.Sprintf("%v %v", msg, pvd.ID.String())
+						}
+						fmt.Println(msg)
+					}
+				}
 			}
 		}(p)
 	}
 	wg.Wait()
+	if log {
+    fmt.Printf("%s: Finish providing cid %v\n", time.Now().Format(time.RFC3339Nano), key.String())
+		activeTestingLock.Lock()
+		delete(activeTesting, key.String())
+		activeTestingLock.Unlock()
+		os.WriteFile(path.Join(ipfsTestFolder, fmt.Sprintf("ok-provide-%v", key.String())), []byte{0}, os.ModePerm)
+	}
 	if exceededDeadline {
 		return context.DeadlineExceeded
 	}
@@ -504,25 +642,58 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 		return len(ps)
 	}
 
-	provs, err := dht.providerStore.GetProviders(ctx, key)
-	if err != nil {
+	log := false
+	ipfsTestFolder := os.Getenv("PERFORMANCE_TEST_DIR")
+	if ipfsTestFolder == "" {
+		ipfsTestFolder = "/ipfs-tests"
+	}
+
+	if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("in-progress-lookup-%v", key.B58String()))); err == nil {
+		os.Remove(path.Join(ipfsTestFolder, fmt.Sprintf("in-progress-lookup-%v", key.B58String())))
+		log = true
+		activeTestingLock.Lock()
+		if activeTesting == nil {
+			activeTesting = map[string]bool{}
+		}
+		_, ok := activeTesting[key.B58String()]
+		if ok {
+			// There is an active testing on.
+			activeTestingLock.Unlock()
+			return
+		} else {
+			activeTesting[key.B58String()] = true
+		}
+		activeTestingLock.Unlock()
+	} else if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("lookup-%v", key.B58String()))); err == nil {
+		// Skip the second search.
 		return
 	}
-	for _, p := range provs {
-		// NOTE: Assuming that this list of peers is unique
-		if psTryAdd(p.ID) {
-			select {
-			case peerOut <- p:
-			case <-ctx.Done():
+
+	if !log {
+		provs, err := dht.providerStore.GetProviders(ctx, key)
+		if err != nil {
+			return
+		}
+		for _, p := range provs {
+			// NOTE: Assuming that this list of peers is unique
+			if psTryAdd(p.ID) {
+				select {
+				case peerOut <- p:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			// If we have enough peers locally, don't bother with remote RPC
+			// TODO: is this a DOS vector?
+			if !findAll && len(ps) >= count {
 				return
 			}
 		}
+	}
 
-		// If we have enough peers locally, don't bother with remote RPC
-		// TODO: is this a DOS vector?
-		if !findAll && len(ps) >= count {
-			return
-		}
+	if log {
+    fmt.Printf("%s: Start searching providers for cid %v\n", time.Now().Format(time.RFC3339Nano), key.B58String())
 	}
 
 	lookupRes, err := dht.runLookupWithFollowup(ctx, string(key),
@@ -532,19 +703,40 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 				Type: routing.SendingQuery,
 				ID:   p,
 			})
-
+			agentVersion := "n.a."
+			if log {
+				if agent, err := dht.peerstore.Get(p, "AgentVersion"); err == nil {
+					agentVersion = agent.(string)
+				}
+        fmt.Printf("%s: Getting providers for cid %v from %v(%v)\n", time.Now().Format(time.RFC3339Nano), key.B58String(), p.String(), agentVersion)
+			}
 			provs, closest, err := dht.protoMessenger.GetProviders(ctx, p, key)
 			if err != nil {
 				return nil, err
 			}
 
 			logger.Debugf("%d provider entries", len(provs))
+			if log {
+        fmt.Printf("%s: Found %v provider entries from from %v(%v)\n", time.Now().Format(time.RFC3339Nano), len(provs), p.String(), agentVersion)
+			}
 
 			// Add unique providers from request, up to 'count'
 			for _, prov := range provs {
 				dht.maybeAddAddrs(prov.ID, prov.Addrs, peerstore.TempAddrTTL)
+				if log {
+          fmt.Printf("%s: Found provider for cid %v from %v(%v): %v\n", time.Now().Format(time.RFC3339Nano), key.B58String(), p.String(), agentVersion, prov.ID.String())
+				}
+
 				logger.Debugf("got provider: %s", prov)
 				if psTryAdd(prov.ID) {
+					if log {
+						agentVersion2 := "n.a."
+						if agent, err := dht.peerstore.Get(prov.ID, "AgentVersion"); err == nil {
+							agentVersion2 = agent.(string)
+						}
+            fmt.Printf("%s: Connected to provider %v(%v) for cid %v from %v(%v)\n", time.Now().Format(time.RFC3339Nano), prov.ID.String(), agentVersion2, key.B58String(), p.String(), agentVersion)
+					}
+
 					logger.Debugf("using provider: %s", prov)
 					select {
 					case peerOut <- *prov:
@@ -561,6 +753,13 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 
 			// Give closer peers back to the query to be queried
 			logger.Debugf("got closer peers: %d %s", len(closest), closest)
+			if log {
+        fmt.Printf("%s: Got %v closest peers to cid %v from %v(%v): ", time.Now().Format(time.RFC3339Nano), len(closest), key.B58String(), p.String(), agentVersion)
+				for _, peer := range closest {
+					fmt.Printf("%v ", peer.ID.String())
+				}
+				fmt.Println()
+			}
 
 			routing.PublishQueryEvent(ctx, &routing.QueryEvent{
 				Type:      routing.PeerResponse,
@@ -574,6 +773,17 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 			return !findAll && psSize() >= count
 		},
 	)
+
+	if log {
+		if ctx.Err() == nil {
+      fmt.Printf("%s: Finish searching providers for cid %v\n", time.Now().Format(time.RFC3339Nano), key.B58String())
+		} else {
+      fmt.Printf("%s: Finish searching providers for cid %v with ctx error: %v\n", time.Now().Format(time.RFC3339Nano), key.B58String(), ctx.Err())
+		}
+		activeTestingLock.Lock()
+		delete(activeTesting, key.B58String())
+		activeTestingLock.Unlock()
+	}
 
 	if err == nil && ctx.Err() == nil {
 		dht.refreshRTIfNoShortcut(kb.ConvertKey(string(key)), lookupRes)
