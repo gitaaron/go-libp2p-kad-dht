@@ -570,7 +570,7 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 	}
 	wg.Wait()
 	if log {
-    fmt.Printf("%s: Finish providing cid %v\n", time.Now().Format(time.RFC3339Nano), key.String())
+    fmt.Printf("%s: Finished providing cid %v\n", time.Now().Format(time.RFC3339Nano), key.String())
 		activeTestingLock.Lock()
 		delete(activeTesting, key.String())
 		activeTestingLock.Unlock()
