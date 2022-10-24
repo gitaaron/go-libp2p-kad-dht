@@ -778,11 +778,7 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 	)
 
 	if log {
-		if ctx.Err() == nil {
-      fmt.Printf("%s: Finished searching providers for cid %v\n", time.Now().Format(time.RFC3339Nano), key.B58String())
-		} else {
-      fmt.Printf("%s: Finished searching providers for cid %v with ctx error: %v\n", time.Now().Format(time.RFC3339Nano), key.B58String(), ctx.Err())
-		}
+    fmt.Printf("%s: Finished searching providers for cid %v with ctx error: %v\n", time.Now().Format(time.RFC3339Nano), key.B58String(), ctx.Err())
 		activeTestingLock.Lock()
 		delete(activeTesting, key.B58String())
 		activeTestingLock.Unlock()
