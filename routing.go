@@ -535,12 +535,15 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 		go func(p peer.ID) {
 			defer wg.Done()
 			logger.Debugf("putProvider(%s, %s)", internal.LoggableProviderRecordBytes(keyMH), p)
-			start := time.Now()
-			err := dht.protoMessenger.PutProvider(ctx, p, keyMH, dht.host)
 			agentVersion := "n.a."
 			if agent, err := dht.peerstore.Get(p, "AgentVersion"); err == nil {
 				agentVersion = agent.(string)
 			}
+			start := time.Now()
+			if log {
+				fmt.Printf("%s: Start putting provider record for cid %v to %v(%v)\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion)
+			}
+			err := dht.protoMessenger.PutProvider(ctx, p, keyMH, dht.host)
 			if err != nil {
 				if log {
 					errStr := strings.ReplaceAll(err.Error(), "\n", " ")
