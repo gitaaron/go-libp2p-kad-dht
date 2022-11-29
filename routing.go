@@ -468,6 +468,8 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 				peers, err := dht.protoMessenger.GetClosestPeers(ctx, p, peer.ID(key))
 				if err != nil {
 					logger.Debugf("error getting closer peers: %s", err)
+					errStr := strings.ReplaceAll(err.Error(), "\n", ",")
+					fmt.Printf("%s: Error getting closest peers for cid %v from %v(%v): %s\n", time.Now().Format(time.RFC3339Nano), peer.ID(key).String(), p.String(), agentVersion, errStr)
 					return nil, err
 				}
 
@@ -539,7 +541,6 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 			if agent, err := dht.peerstore.Get(p, "AgentVersion"); err == nil {
 				agentVersion = agent.(string)
 			}
-			start := time.Now()
 			if log {
 				fmt.Printf("%s: Start putting provider record for cid %v to %v(%v)\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion)
 			}
@@ -547,12 +548,12 @@ func (dht *IpfsDHT) Provide(ctx context.Context, key cid.Cid, brdcst bool) (err 
 			if err != nil {
 				if log {
 					errStr := strings.ReplaceAll(err.Error(), "\n", " ")
-          fmt.Printf("%s: Error putting provider record for cid %v to %v(%v) [%v] time taken: %v\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion, errStr, time.Since(start))
+					fmt.Printf("%s: Error putting provider record for cid %v to %v(%v) [%v]\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion, errStr)
 				}
 				logger.Debug(err)
 			} else {
 				if log {
-          fmt.Printf("%s: Succeed in putting provider record for cid %v to %v(%v) time taken: %v\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion, time.Since(start))
+					fmt.Printf("%s: Succeed in putting provider record for cid %v to %v(%v)\n", time.Now().Format(time.RFC3339Nano), key.String(), p.String(), agentVersion)
 					// Now try to get the record from the peer
 					pvds, _, err := dht.protoMessenger.GetProviders(ctx, p, keyMH)
 					if err != nil {
@@ -720,14 +721,18 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 
 			logger.Debugf("%d provider entries", len(provs))
 			if log {
-        fmt.Printf("%s: Found %v provider entries from from %v(%v)\n", time.Now().Format(time.RFC3339Nano), len(provs), p.String(), agentVersion)
+				errMsg := ""
+				if err != nil {
+					errMsg = strings.ReplaceAll(err.Error(), "\n", ", ")
+				}
+				fmt.Printf("%s: Found %v provider entries for cid %v from %v(%v): %s\n", time.Now().Format(time.RFC3339Nano), len(provs), key.B58String(), p.String(), agentVersion, errMsg)
 			}
 
 			// Add unique providers from request, up to 'count'
 			for _, prov := range provs {
 				dht.maybeAddAddrs(prov.ID, prov.Addrs, peerstore.TempAddrTTL)
 				if log {
-          fmt.Printf("%s: Found provider for cid %v from %v(%v): %v\n", time.Now().Format(time.RFC3339Nano), key.B58String(), p.String(), agentVersion, prov.ID.String())
+					fmt.Printf("%s: Found provider %v for cid %v from %v(%v)\n", time.Now().Format(time.RFC3339Nano), prov.ID.String(), key.B58String(), p.String(), agentVersion)
 				}
 
 				logger.Debugf("got provider: %s", prov)
