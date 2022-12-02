@@ -652,25 +652,17 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 		ipfsTestFolder = "/ipfs-tests"
 	}
 
-	if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("in-progress-lookup-%v", key.B58String()))); err == nil {
-		os.Remove(path.Join(ipfsTestFolder, fmt.Sprintf("in-progress-lookup-%v", key.B58String())))
+	if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("lookup-%v", key.B58String()))); err == nil {
 		log = true
 		activeTestingLock.Lock()
 		if activeTesting == nil {
 			activeTesting = map[string]bool{}
 		}
 		_, ok := activeTesting[key.B58String()]
-		if ok {
-			// There is an active testing on.
-			activeTestingLock.Unlock()
-			return
-		} else {
+		if !ok {
 			activeTesting[key.B58String()] = true
 		}
 		activeTestingLock.Unlock()
-	} else if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("lookup-%v", key.B58String()))); err == nil {
-		// Skip the second search.
-		return
 	}
 
 	if !log {
@@ -785,6 +777,9 @@ func (dht *IpfsDHT) findProvidersAsyncRoutine(ctx context.Context, key multihash
 	if log {
     fmt.Printf("%s: Finished searching providers for cid %v with ctx error: %v\n", time.Now().Format(time.RFC3339Nano), key.B58String(), ctx.Err())
 		activeTestingLock.Lock()
+		if _, err := os.Stat(path.Join(ipfsTestFolder, fmt.Sprintf("in-progress-lookup-%v", key.B58String()))); err == nil {
+			os.Remove(path.Join(ipfsTestFolder, fmt.Sprintf("in-progress-lookup-%v", key.B58String())))
+		}
 		delete(activeTesting, key.B58String())
 		activeTestingLock.Unlock()
 	}
